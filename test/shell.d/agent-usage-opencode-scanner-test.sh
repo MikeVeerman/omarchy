@@ -202,6 +202,39 @@ jq -e . >/dev/null 2>&1 <<<"$result" ||
   fail "opencode collector stays out of the panel without recorded usage" "$result"
 pass "opencode collector stays out of the panel without recorded usage"
 
+# --------------------------------------------------------------------- mark
+#
+# Panel.qml looks for assets/<id>-light.svg on light surfaces and falls back
+# to assets/<id>.svg, so both names have to exist for the mark to survive a
+# theme switch.
+
+assets="$ROOT/shell/plugins/agents/assets"
+
+for variant in opencode opencode-light; do
+  [[ -f $assets/$variant.svg ]] ||
+    fail "opencode ships the $variant mark"
+  python3 -c "import sys, xml.etree.ElementTree as t; t.parse(sys.argv[1])" "$assets/$variant.svg" ||
+    fail "$variant mark is well-formed SVG"
+done
+pass "opencode ships a mark for dark and light surfaces"
+
+# Qt's SVG renderer ignores <mask>, so a mark that relies on one draws wrong.
+# The upstream brand files wrap the artwork in a full-canvas luminance mask
+# that changes nothing; re-importing them without stripping it would regress.
+for variant in opencode opencode-light; do
+  grep -qi "<mask" "$assets/$variant.svg" &&
+    fail "$variant mark avoids a mask Qt cannot render"
+done
+pass "opencode mark avoids a mask Qt cannot render"
+
+# The two variants must not be the same artwork, or one surface gets an
+# invisible mark.
+[[ $(grep -o '#F1ECEC' "$assets/opencode.svg" | head -1) == "#F1ECEC" ]] ||
+  fail "opencode mark keeps the light-surface brand color"
+[[ $(grep -o '#211E1E' "$assets/opencode-light.svg" | head -1) == "#211E1E" ]] ||
+  fail "opencode light mark keeps the dark-surface brand color"
+pass "opencode mark variants carry their own brand colors"
+
 # ------------------------------------------------------------------- caching
 
 CACHE_HOME=$(mktemp -d)

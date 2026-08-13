@@ -69,6 +69,12 @@ pass "opencode collector counts assistant messages only"
   fail "opencode collector identifies itself with an empty limits list" "$result"
 pass "opencode collector identifies itself with an empty limits list"
 
+# An empty tierLabel makes the panel call the hero a "Subscription", which
+# opencode never is: it spends a local runner or a per-token API key.
+[[ $(jq -r '.tierLabel' <<<"$result") == "Bring your own model" ]] ||
+  fail "opencode collector names what the hero actually is" "$result"
+pass "opencode collector names what the hero actually is"
+
 [[ $(jq -r '.recentDays | length' <<<"$result") == "7" ]] ||
   fail "opencode collector reports a full week of days" "$result"
 [[ $(jq -r '.recentDays[-1].messageCount' <<<"$result") == "197" ]] ||

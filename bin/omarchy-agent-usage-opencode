@@ -32,6 +32,10 @@ from typing import Any
 AGENT_ID = "opencode"
 AGENT_NAME = "opencode"
 
+# The hero line under the name. Every other agent names the plan it bills
+# against; opencode has none, so it names the arrangement instead.
+TIER_LABEL = "Bring your own model"
+
 # Provider ids the other collectors already report. The match is exact, the
 # same way they match: a custom "anthropic-proxy" gateway is not the
 # subscription those tabs track, so it belongs here.
@@ -339,6 +343,9 @@ def main() -> None:
     # opencode bills through whatever provider it was pointed at, so there is
     # no allowance to report and no auth of its own to check.
     "limits": [],
+    # Without this the hero calls itself a "Subscription", which is the one
+    # thing opencode never is: it spends a local runner or a per-token key.
+    "tierLabel": TIER_LABEL,
     # Nothing here is worth a tab until opencode has actually run something.
     "ready": number(stats.get("totalPrompts")) > 0,
     "hasLocalStats": True,

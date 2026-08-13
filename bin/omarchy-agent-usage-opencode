@@ -1,0 +1,351 @@
+#!/usr/bin/python3
+# omarchy:summary=Print the opencode usage record as JSON
+# omarchy:args=[--force] [--limits-only]
+# omarchy:hidden=true
+"""Collect opencode usage into one display-ready JSON record.
+
+opencode drives whatever model the user configured: a local runner, an
+aggregator like OpenRouter, or a first-party API. None of those expose a
+subscription window, so this collector reports no limits at all and the panel
+hides the limits section. What it does report is tokens, which is the only
+usage figure a local model ever produces.
+
+Anthropic and OpenAI messages are deliberately left out. The claude and codex
+collectors already claim exactly those two provider ids out of opencode's own
+records, and counting them here would show the same tokens on two tabs.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import sqlite3
+import sys
+import tempfile
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+AGENT_ID = "opencode"
+AGENT_NAME = "opencode"
+
+# Provider ids the other collectors already report. The match is exact, the
+# same way they match: a custom "anthropic-proxy" gateway is not the
+# subscription those tabs track, so it belongs here.
+CLAIMED_PROVIDERS = {"anthropic", "openai"}
+
+# A scan this recent is only reused to dedup concurrent collector runs (the
+# update command backgrounds one per agent while the panel refreshes on its
+# own); every periodic widget refresh lands a real rescan. --limits-only
+# promises only fresh limits, and this collector has none, so it may reuse a
+# scan for much longer.
+SCAN_REUSE_SECONDS = 20
+LIMITS_ONLY_REUSE_SECONDS = 900
+
+now = datetime.now()
+today = now.strftime("%Y-%m-%d")
+recent_dates = [(now - timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range(6, -1, -1)]
+recent = {day: {"date": day, "messageCount": 0} for day in recent_dates}
+today_tokens_by_model: dict[str, int] = {}
+model_usage: dict[str, dict[str, int]] = {}
+today_sessions: set[str] = set()
+active_days: set[str] = set()
+
+today_prompts = 0
+today_total_tokens = 0
+total_prompts = 0
+total_sessions: set[str] = set()
+
+
+def number(value):
+  try:
+    return int(value or 0)
+  except Exception:
+    return 0
+
+
+def model_name(raw):
+  # opencode model ids carry the vendor as a path ("qwen/qwen3-coder-next").
+  # The panel lists models by name, so keep the last segment only.
+  value = str(raw or "").rstrip("/").split("/")[-1]
+  return value if value else AGENT_ID
+
+
+def opencode_root() -> Path:
+  data_home = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share"))
+  return data_home / "opencode"
+
+
+def add_usage(day, session_key, model, input_tokens, output_tokens, cache_read, cache_write):
+  global today_prompts, today_total_tokens, total_prompts
+  total = input_tokens + output_tokens + cache_read + cache_write
+  total_prompts += 1
+  total_sessions.add(session_key)
+  active_days.add(day)
+
+  bucket = model_usage.setdefault(model, {
+    "inputTokens": 0,
+    "outputTokens": 0,
+    "cacheReadInputTokens": 0,
+    "cacheCreationInputTokens": 0,
+  })
+  bucket["inputTokens"] += input_tokens
+  bucket["outputTokens"] += output_tokens
+  bucket["cacheReadInputTokens"] += cache_read
+  bucket["cacheCreationInputTokens"] += cache_write
+
+  if day in recent:
+    recent[day]["messageCount"] += total
+
+  if day == today:
+    today_prompts += 1
+    today_sessions.add(session_key)
+    today_total_tokens += total
+    today_tokens_by_model[model] = today_tokens_by_model.get(model, 0) + total
+
+
+def consume_message(entry: Any, session_id: str) -> None:
+  """Fold one opencode message into the running totals, or ignore it."""
+  if not isinstance(entry, dict) or entry.get("role") != "assistant":
+    return
+  provider = str(entry.get("providerID") or "")
+  if provider in CLAIMED_PROVIDERS:
+    return
+
+  tokens = entry.get("tokens") or {}
+  cache = tokens.get("cache") or {}
+  input_tokens = number(tokens.get("input"))
+  # opencode keeps thinking tokens out of output; both are generated.
+  output_tokens = number(tokens.get("output")) + number(tokens.get("reasoning"))
+  cache_read = number(cache.get("read"))
+  cache_write = number(cache.get("write"))
+  # Some providers (ollama, today) report no usage at all. A message that
+  # recorded nothing is not a prompt anyone can account for.
+  if input_tokens + output_tokens + cache_read + cache_write <= 0:
+    return
+
+  created = number((entry.get("time") or {}).get("created"))
+  day = datetime.fromtimestamp(created / 1000).strftime("%Y-%m-%d") if created > 0 else today
+  session_key = "opencode:" + str(entry.get("sessionID") or session_id)
+  add_usage(day, session_key, model_name(entry.get("modelID")), input_tokens, output_tokens, cache_read, cache_write)
+
+
+# ------------------------------------------------------------------- sources
+#
+# opencode has shipped two message stores. Current versions write one JSON
+# file per message under storage/message/<session>/; older ones kept the same
+# payloads as rows in opencode.db. Read whichever exists so the tab does not
+# depend on when the user installed opencode.
+
+
+def scan_message_files(root: Path) -> bool:
+  message_root = root / "storage" / "message"
+  if not message_root.is_dir():
+    return False
+
+  found = False
+  try:
+    sessions = sorted(os.scandir(message_root), key=lambda entry: entry.name)
+  except OSError:
+    return False
+
+  for session in sessions:
+    if not session.is_dir():
+      continue
+    found = True
+    try:
+      messages = os.scandir(session.path)
+    except OSError:
+      continue
+    with messages:
+      for message in messages:
+        if not message.name.endswith(".json") or not message.is_file():
+          continue
+        # One malformed file must not abort the scan, so every shape
+        # assumption lives inside the try.
+        try:
+          with open(message.path, "r", encoding="utf-8") as handle:
+            entry = json.load(handle)
+        except Exception:
+          continue
+        try:
+          consume_message(entry, session.name)
+        except Exception:
+          continue
+  return found
+
+
+def scan_message_db(root: Path) -> bool:
+  db = root / "opencode.db"
+  if not db.is_file():
+    return False
+
+  try:
+    # Read-only: opencode may be writing right now.
+    conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+  except sqlite3.Error:
+    return False
+  try:
+    conn.execute("PRAGMA query_only = ON")
+    # opencode DBs grow huge (every historical message, JSON included), so let
+    # SQLite reject the rows this collector never counts before Python parses
+    # a multi-megabyte blob. The guard is pure acceleration: consume_message
+    # re-checks the role, and rows that are not well-formed JSON are dropped
+    # by the per-row try below.
+    rows = conn.execute(
+      "SELECT session_id, data FROM message"
+      " WHERE data LIKE '%\"role\"%:%\"assistant\"%'"
+      " AND CASE WHEN json_valid(data) THEN json_extract(data, '$.role') END = 'assistant'"
+    )
+    for session_id, raw in rows:
+      try:
+        consume_message(json.loads(raw), str(session_id))
+      except Exception:
+        continue
+  except sqlite3.Error:
+    return False
+  finally:
+    conn.close()
+  return True
+
+
+# -------------------------------------------------------------------- caching
+
+
+def cache_root() -> Path:
+  root = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")) / "omarchy" / "agent-usage"
+  root.mkdir(parents=True, exist_ok=True)
+  return root
+
+
+def cache_file() -> Path:
+  digest = hashlib.sha1(str(opencode_root()).encode("utf-8")).hexdigest()[:16]
+  return cache_root() / f"opencode-scan-{digest}.json"
+
+
+def read_fresh_json(path: Path, max_age_seconds: float):
+  if max_age_seconds <= 0 or not path.exists():
+    return None
+  try:
+    # A negative age means the mtime is in the future: the clock moved
+    # backwards since the write, so the cache's freshness cannot be trusted.
+    age = time.time() - path.stat().st_mtime
+    if 0 <= age <= max_age_seconds:
+      return json.loads(path.read_text(encoding="utf-8"))
+  except Exception:
+    return None
+  return None
+
+
+def write_json(path: Path, payload) -> None:
+  # A temp name unique to this writer, not derived from the target: several
+  # collectors can run at once, and a shared temp path means the second
+  # replace finds the first one's file already moved away.
+  handle_fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+  tmp = Path(tmp_name)
+  try:
+    with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
+      handle.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    # mkstemp opens at 0600; nothing in the cache is sensitive, so open it up
+    # to the usual 0644.
+    tmp.chmod(0o644)
+    tmp.replace(path)
+  except BaseException:
+    tmp.unlink(missing_ok=True)
+    raise
+
+
+# The cache payload is a versioned envelope around the local-stats dict, so a
+# corrupted or foreign-shaped file is a cache miss (rescan + rewrite) instead
+# of a crash or a garbage record.
+def read_cached_stats(path: Path, max_age_seconds: float):
+  cached = read_fresh_json(path, max_age_seconds)
+  if not isinstance(cached, dict) or cached.get("schemaVersion") != 1:
+    return None
+  # today* fields only mean "today" on the day they were scanned. A cache from
+  # another local date (midnight passed, or the clock moved) is a miss, not
+  # merely old, whatever its mtime says.
+  if cached.get("scanDate") != today:
+    return None
+  stats = cached.get("stats")
+  if not isinstance(stats, dict):
+    return None
+  if not all(key in stats for key in ("todayPrompts", "todayTotalTokens", "recentDays", "activeDates", "modelUsage")):
+    return None
+  return stats
+
+
+def write_cached_stats(path: Path, stats) -> None:
+  try:
+    write_json(path, {"schemaVersion": 1, "scanDate": today, "stats": stats})
+  except Exception as exc:
+    print(f"omarchy-agent-usage-opencode: cache write failed: {exc}", file=sys.stderr)
+
+
+def local_stats():
+  """Snapshot the aggregated local usage into the record's stats dict."""
+  return {
+    "todayPrompts": today_prompts,
+    "todaySessions": len(today_sessions),
+    "todayTotalTokens": today_total_tokens,
+    "todayTokensByModel": today_tokens_by_model,
+    "recentDays": [recent[day] for day in recent_dates],
+    "totalPrompts": total_prompts,
+    "totalSessions": len(total_sessions),
+    # Days with any recorded usage, for the all-time "N days" summary. The
+    # dates travel too: merging snapshots from several machines needs their
+    # union, which a count alone cannot give.
+    "activeDays": len(active_days),
+    "activeDates": sorted(active_days),
+    "modelUsage": model_usage,
+  }
+
+
+def cached_local_stats(max_age_seconds: float):
+  path = cache_file()
+  cached = read_cached_stats(path, max_age_seconds)
+  if cached is not None:
+    return cached
+
+  root = opencode_root()
+  # Current storage wins: a machine that upgraded opencode keeps the old
+  # database next to the new files, and counting both would double every
+  # message written before the migration.
+  if not scan_message_files(root):
+    scan_message_db(root)
+
+  stats = local_stats()
+  write_cached_stats(path, stats)
+  return stats
+
+
+def main() -> None:
+  parser = argparse.ArgumentParser(add_help=False)
+  parser.add_argument("--force", action="store_true")
+  parser.add_argument("--limits-only", action="store_true")
+  args, _ = parser.parse_known_args()
+
+  max_age = 0 if args.force else (LIMITS_ONLY_REUSE_SECONDS if args.limits_only else SCAN_REUSE_SECONDS)
+  stats = cached_local_stats(max_age)
+
+  record = {
+    "schemaVersion": 1,
+    "id": AGENT_ID,
+    "name": AGENT_NAME,
+    "updatedAt": datetime.now(timezone.utc).isoformat(),
+    # opencode bills through whatever provider it was pointed at, so there is
+    # no allowance to report and no auth of its own to check.
+    "limits": [],
+    # Nothing here is worth a tab until opencode has actually run something.
+    "ready": number(stats.get("totalPrompts")) > 0,
+    "hasLocalStats": True,
+  }
+  record.update(stats)
+  print(json.dumps(record, separators=(",", ":")))
+
+
+if __name__ == "__main__":
+  main()

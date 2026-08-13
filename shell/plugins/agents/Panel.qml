@@ -248,7 +248,10 @@ Panel {
       })
     }
     rows.sort(function(a, b) { return b.total - a.total })
-    return rows.slice(0, 4)
+    // Four rows suit an agent that runs one vendor's models. An agent that
+    // routes across providers runs many more, and the short list buried the
+    // model in use under the all-time heaviest ones.
+    return rows.slice(0, 8)
   }
 
   function modelTooltip(row) {

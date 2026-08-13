@@ -14,4 +14,9 @@ assert(/if \(buttonCode === Qt\.RightButton\) root\.launchAgent\(\)/.test(panelS
 assert(/else if \(buttonCode === Qt\.MiddleButton\) root\.selectProvider\(root\.providerIndex \+ 1\)/.test(panelSource), 'agents middle click still advances the subscription')
 assert(/else root\.toggle\(\)/.test(panelSource), 'agents left click still toggles the panel')
 assert(!/if \(buttonCode === Qt\.RightButton\) root\.refreshNow\(\)/.test(panelSource), 'agents right click no longer refreshes')
+
+// Agents that route across providers run far more models than a single-vendor
+// subscription does, so a four-row list hid whatever the user was running at
+// the time behind their all-time heaviest models.
+assert(/return rows\.slice\(0, 8\)/.test(panelSource), 'agents panel lists more than four models')
 JS

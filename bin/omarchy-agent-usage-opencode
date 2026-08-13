@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 AGENT_ID = "opencode"
-AGENT_NAME = "opencode"
+AGENT_NAME = "OpenCode"
 
 # The hero line under the name. Every other agent names the plan it bills
 # against; opencode has none, so it names the arrangement instead.

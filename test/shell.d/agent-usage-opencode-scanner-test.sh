@@ -69,6 +69,12 @@ pass "opencode collector counts assistant messages only"
   fail "opencode collector identifies itself with an empty limits list" "$result"
 pass "opencode collector identifies itself with an empty limits list"
 
+# The id keys the record file and matches the collector name, so it stays
+# lowercase; the name is what the hero and the switch chip display.
+[[ $(jq -r '.name' <<<"$result") == "OpenCode" ]] ||
+  fail "opencode collector displays a capitalized name" "$result"
+pass "opencode collector displays a capitalized name"
+
 # An empty tierLabel makes the panel call the hero a "Subscription", which
 # opencode never is: it spends a local runner or a per-token API key.
 [[ $(jq -r '.tierLabel' <<<"$result") == "Bring your own model" ]] ||
